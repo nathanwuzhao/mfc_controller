@@ -6,8 +6,6 @@ import time
 import serial
 from serial import SerialException
 
-import numpy as np
-import matplotlib.pyplot as plt
 
 class AlicatError(Exception):
     """base exception for alicat driver errors"""

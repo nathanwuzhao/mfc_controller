@@ -1,24 +1,6 @@
-"""
-profile_runner.py
-
-Profile execution layer for Alicat MFC flow control.
-
-This module assumes you already have alicat_mfc.py containing:
-    - AlicatMFC
-    - MFCReading
-
-Main concept:
-    ProfileRunner repeatedly computes q_cmd = profile(t),
-    clamps it to safe flow limits, sends it to the MFC, polls the MFC,
-    and logs the result.
-
-The profile output should be in the same engineering units currently
-configured on the Alicat, usually SLPM.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Callable, Optional, List, Tuple, Dict, Any
 import csv
@@ -28,15 +10,12 @@ import traceback
 
 from alicat_mfc import AlicatMFC, MFCReading, AlicatError
 
-
 FlowProfile = Callable[[float], float]
-
 
 def constant_profile(value: float) -> FlowProfile:
     def profile(t: float) -> float:
         return value
     return profile
-
 
 def ramp_profile(
     start: float,
@@ -62,7 +41,6 @@ def ramp_profile(
         return stop if hold_after else 0.0
 
     return profile
-
 
 def gaussian_profile(
     baseline: float,
@@ -245,12 +223,16 @@ class ProfileRunnerConfig:
     zero_on_finish: bool = True
     settle_s: float = 1.0
 
-    log_path: Optional[Path] = Path("profile_log.csv")
+    log_path: Optional[Path] = field(
+        default_factory=lambda: Path("profile_log.csv")
+    )
 
 
 @dataclass
 class ProfileLogRow:
     t_s: float
+    event: str
+
     q_target: float
     q_commanded: float
     command_sent: bool
@@ -306,14 +288,6 @@ class ProfileRunner:
         return max(self.config.min_flow, min(self.config.max_flow, q))
 
     def run(self) -> List[ProfileLogRow]:
-        """
-        Execute the profile.
-
-        Returns
-        -------
-        rows:
-            List of logged rows.
-        """
         cfg = self.config
 
         if not self.mfc.is_connected:
@@ -346,13 +320,24 @@ class ProfileRunner:
                 should_control = t_s >= next_control_t
                 should_poll = t_s >= next_poll_t
 
+                if not should_control and not should_poll:
+                    sleep_s = min(next_control_t, next_poll_t) - t_s
+                    if sleep_s > 0:
+                        time.sleep(min(sleep_s, 0.05))
+                    continue
+
                 q_target = self.profile(t_s)
                 q_commanded = self.clamp_flow(q_target)
 
                 command_sent = False
+                reading: Optional[MFCReading] = None
                 error: Optional[str] = None
 
+                event_parts: List[str] = []
+
                 if should_control:
+                    event_parts.append("control")
+                    
                     should_send = (
                         last_commanded is None
                         or abs(q_commanded - last_commanded)
@@ -365,25 +350,36 @@ class ProfileRunner:
                             last_commanded = q_commanded
                             command_sent = True
                         except Exception as exc:
-                            error = f"setpoint_error: {type(exc).__name__}: {exc}"
+                            error = (
+                            f"setpoint_error: {type(exc).__name__}: {exc}"
+                            )
+
+                            # log the specific setpoint failure before raising
+                            self.rows.append(
+                                self._make_log_row(
+                                    t_s=t_s,
+                                    event="control",
+                                    q_target=q_target,
+                                    q_commanded=q_commanded,
+                                    command_sent=False,
+                                    reading=None,
+                                    error=error,
+                                )
+                            )
                             raise
 
                     next_control_t += cfg.control_period_s
 
-                    # If the loop fell behind, resynchronize instead of trying
-                    # to spam many old commands.
+                    # if the loop fell behind, resynchronize instead of trying to spam old commands
                     if next_control_t < t_s - cfg.control_period_s:
                         next_control_t = t_s + cfg.control_period_s
 
-                reading: Optional[MFCReading] = None
-
                 if should_poll:
+                    event_parts.append("poll")
                     try:
                         reading = self.mfc.poll()
                     except Exception as exc:
                         error = f"poll_error: {type(exc).__name__}: {exc}"
-                        # Poll failure should be logged, but not necessarily
-                        # fatal. You can change this behavior if desired.
                         reading = None
 
                     next_poll_t += cfg.poll_period_s
@@ -391,27 +387,23 @@ class ProfileRunner:
                     if next_poll_t < t_s - cfg.poll_period_s:
                         next_poll_t = t_s + cfg.poll_period_s
 
-                    self.rows.append(
-                        self._make_log_row(
-                            t_s=t_s,
-                            q_target=q_target,
-                            q_commanded=q_commanded,
-                            command_sent=command_sent,
-                            reading=reading,
-                            error=error,
-                        )
+                self.rows.append(
+                    self._make_log_row(
+                        t_s=t_s,
+                        event="+".join(event_parts),
+                        q_target=q_target,
+                        q_commanded=q_commanded,
+                        command_sent=command_sent,
+                        reading=reading,
+                        error=error,
                     )
-
-                sleep_s = min(next_control_t, next_poll_t) - (
-                    time.monotonic() - start_monotonic
                 )
-                if sleep_s > 0:
-                    time.sleep(min(sleep_s, 0.05))
 
         except KeyboardInterrupt:
             self.rows.append(
                 ProfileLogRow(
                     t_s=time.monotonic() - start_monotonic,
+                    event="keyboard_interrupt",
                     q_target=0.0,
                     q_commanded=0.0,
                     command_sent=False,
@@ -421,16 +413,19 @@ class ProfileRunner:
             raise
 
         except Exception as exc:
-            self.rows.append(
-                ProfileLogRow(
-                    t_s=time.monotonic() - start_monotonic,
-                    q_target=0.0,
-                    q_commanded=0.0,
-                    command_sent=False,
-                    error=f"fatal_error: {type(exc).__name__}: {exc}\n"
-                          f"{traceback.format_exc()}",
+            last_error = self.rows[-1].error if self.rows else None
+            if last_error is None or not last_error.startswith("setpoint_error"):
+                self.rows.append(
+                    ProfileLogRow(
+                        t_s=time.monotonic() - start_monotonic,
+                        event="fatal_error",
+                        q_target=0.0,
+                        q_commanded=0.0,
+                        command_sent=False,
+                        error=f"fatal_error: {type(exc).__name__}: {exc}\n"
+                            f"{traceback.format_exc()}",
+                    )
                 )
-            )
             raise
 
         finally:
@@ -438,7 +433,19 @@ class ProfileRunner:
                 try:
                     self.mfc.zero_flow()
                 except Exception:
-                    pass
+                    self.rows.append(
+                        ProfileLogRow(
+                            t_s=time.monotonic() - start_monotonic,
+                            event="zero_on_finish_error",
+                            q_target=0.0,
+                            q_commanded=0.0,
+                            command_sent=False,
+                            error=(
+                                f"zero_on_finish_error: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        )
+                    )
 
             if cfg.log_path is not None:
                 self.write_csv(cfg.log_path)
@@ -448,6 +455,7 @@ class ProfileRunner:
     def _make_log_row(
         self,
         t_s: float,
+        event: str,
         q_target: float,
         q_commanded: float,
         command_sent: bool,
@@ -457,6 +465,7 @@ class ProfileRunner:
         if reading is None:
             return ProfileLogRow(
                 t_s=t_s,
+                event=event,
                 q_target=q_target,
                 q_commanded=q_commanded,
                 command_sent=command_sent,
@@ -465,6 +474,7 @@ class ProfileRunner:
 
         return ProfileLogRow(
             t_s=t_s,
+            event=event,
             q_target=q_target,
             q_commanded=q_commanded,
             command_sent=command_sent,
