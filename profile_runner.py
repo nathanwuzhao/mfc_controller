@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Callable, Optional, List, Tuple, Dict, Any
+from typing import Callable, Optional, List, Tuple
 import csv
 import math
 import time
@@ -249,16 +249,20 @@ class ProfileLogRow:
 
     error: Optional[str] = None
 
+ProgressCallback = Callable[[ProfileLogRow], None]
+
 class ProfileRunner:
     def __init__(
         self,
         mfc: AlicatMFC,
         profile: FlowProfile,
         config: ProfileRunnerConfig,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> None:
         self.mfc = mfc
         self.profile = profile
         self.config = config
+        self.progress_callback = progress_callback
 
         self.rows: List[ProfileLogRow] = []
         self._stop_requested = False
@@ -283,6 +287,11 @@ class ProfileRunner:
 
     def request_stop(self) -> None:
         self._stop_requested = True
+
+    def _append_row(self, row: ProfileLogRow) -> None:
+        self.rows.append(row)
+        if self.progress_callback is not None:
+            self.progress_callback(row)
 
     def clamp_flow(self, q: float) -> float:
         return max(self.config.min_flow, min(self.config.max_flow, q))
@@ -315,6 +324,15 @@ class ProfileRunner:
                     break
 
                 if self._stop_requested:
+                    self._append_row(
+                        ProfileLogRow(
+                            t_s=t_s,
+                            event="stop_requested",
+                            q_target=0.0,
+                            q_commanded=0.0,
+                            command_sent=False,
+                        )
+                    )
                     break
 
                 should_control = t_s >= next_control_t
@@ -334,6 +352,8 @@ class ProfileRunner:
                 error: Optional[str] = None
 
                 event_parts: List[str] = []
+
+                #control tick
 
                 if should_control:
                     event_parts.append("control")
@@ -355,7 +375,7 @@ class ProfileRunner:
                             )
 
                             # log the specific setpoint failure before raising
-                            self.rows.append(
+                            self._append_row(
                                 self._make_log_row(
                                     t_s=t_s,
                                     event="control",
@@ -374,6 +394,7 @@ class ProfileRunner:
                     if next_control_t < t_s - cfg.control_period_s:
                         next_control_t = t_s + cfg.control_period_s
 
+                #poll tick        
                 if should_poll:
                     event_parts.append("poll")
                     try:
@@ -387,7 +408,7 @@ class ProfileRunner:
                     if next_poll_t < t_s - cfg.poll_period_s:
                         next_poll_t = t_s + cfg.poll_period_s
 
-                self.rows.append(
+                self._append_row(
                     self._make_log_row(
                         t_s=t_s,
                         event="+".join(event_parts),
@@ -400,7 +421,7 @@ class ProfileRunner:
                 )
 
         except KeyboardInterrupt:
-            self.rows.append(
+            self._append_row(
                 ProfileLogRow(
                     t_s=time.monotonic() - start_monotonic,
                     event="keyboard_interrupt",
@@ -415,7 +436,7 @@ class ProfileRunner:
         except Exception as exc:
             last_error = self.rows[-1].error if self.rows else None
             if last_error is None or not last_error.startswith("setpoint_error"):
-                self.rows.append(
+                self._append_row(
                     ProfileLogRow(
                         t_s=time.monotonic() - start_monotonic,
                         event="fatal_error",
@@ -432,8 +453,8 @@ class ProfileRunner:
             if cfg.zero_on_finish:
                 try:
                     self.mfc.zero_flow()
-                except Exception:
-                    self.rows.append(
+                except Exception as exc:
+                    self._append_row(
                         ProfileLogRow(
                             t_s=time.monotonic() - start_monotonic,
                             event="zero_on_finish_error",

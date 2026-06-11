@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Callable
 import time
 import serial
 from serial import SerialException
@@ -60,6 +60,12 @@ class AlicatMFC:
 
     debug:
         if True, prints TX/RX traffic
+
+    tx_callback:
+        optional callback called with each command string sent to the device
+
+    rx_callback:
+        optional callback called with each response line received from the device
     """
 
     def __init__(
@@ -70,6 +76,8 @@ class AlicatMFC:
         timeout: float = 1.0,
         write_timeout: float = 1.0,
         debug: bool = False,
+        tx_callback: Optional[Callable[[str], None]] = None,
+        rx_callback: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.port = port
         self.unit_id = unit_id.upper()
@@ -77,8 +85,26 @@ class AlicatMFC:
         self.timeout = timeout
         self.write_timeout = write_timeout
         self.debug = debug
+        self.tx_callback = tx_callback
+        self.rx_callback = rx_callback
 
         self._ser: Optional[serial.Serial] = None
+
+    def set_observers(
+        self,
+        tx_callback: Optional[Callable[[str], None]] = None,
+        rx_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.tx_callback = tx_callback
+        self.rx_callback = rx_callback
+
+    def _emit_tx(self, command: str) -> None:
+        if self.tx_callback is not None:
+            self.tx_callback(command)
+
+    def _emit_rx(self, response: str) -> None:
+        if self.rx_callback is not None:
+            self.rx_callback(response)
 
     def connect(self) -> None:
         if self._ser is not None and self._ser.is_open:
@@ -153,6 +179,7 @@ class AlicatMFC:
             print(f"TX: {wire!r}")
 
         try:
+            self._emit_tx(command)
             ser.write(wire)
             ser.flush()
         except SerialException as exc:
@@ -177,6 +204,7 @@ class AlicatMFC:
         if not text:
             raise AlicatTimeoutError("received empty Alicat response.")
 
+        self._emit_rx(text)
         return text
 
     def command(self, command: str, expect_response: bool = True) -> Optional[str]:
